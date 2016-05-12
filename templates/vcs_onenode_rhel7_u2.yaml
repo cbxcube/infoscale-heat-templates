@@ -1,0 +1,184 @@
+heat_template_version: 2016-04-08
+
+description: Template to deploy a single node VCS cluster for RHEL7.2 compute instance
+
+parameters:
+    image:
+        type: string
+        label: Image name or ID
+        description: Image to be used for compute instance
+        default: rhel7.2
+    flavor:
+        type: string
+        label: Flavor
+        description: Type of instance (flavor) to be used
+        default: m1.small
+    key:
+        type: string
+        label: Key name
+        description: Name of key-pair to be used for compute instance
+    public_network:
+        type: string
+        label: Public network name or ID
+        description: Public network with floating IP addresses
+    dns_server:
+        type: string
+        label: DNS server name or IP
+        description: DNS server for compute instance
+    rhel7_u2_x86_media:
+        type: string
+        label: Local RHEL 7 u2 x86 media location
+        description: Local RHEL 7 u2 x86 media location
+    hostname:
+        type: string
+        description:  Instance hostname
+    fqdn:
+        type: string
+        description: Instance FQDN (ex. inst1.veritas.com)
+    vcs_install_media:
+        type: string
+        description: Veritas InfoScale installation media location
+
+resources:
+    vrts_router:
+        type: OS::Neutron::Router
+        properties:
+            name: vrts_router
+
+    vrts_router_gateway:
+        type: OS::Neutron::RouterGateway
+        properties:
+            router_id: { get_resource: vrts_router }
+            network: { get_param: public_network }
+
+    vrts_private_network:
+        type: OS::Neutron::Net
+        properties:
+            name: vrts_private_network
+
+    vrts_private_subnet:
+        type: OS::Neutron::Subnet
+        properties:
+            name: vrts_private_subnet
+            network_id: { get_resource: vrts_private_network }
+            cidr: 192.168.101.0/24
+            gateway_ip: 192.168.101.1
+            enable_dhcp: true
+            dns_nameservers:
+                - { get_param: dns_server }
+
+    vrts_router_interface:
+        type: OS::Neutron::RouterInterface
+        properties:
+            router_id: { get_resource: vrts_router }
+            subnet_id: { get_resource: vrts_private_subnet }
+
+    vrts_security_group:
+        type: OS::Neutron::SecurityGroup
+        properties:
+            name: vrts_security_group
+            rules:
+                - protocol: tcp
+                  remote_ip_prefix: 0.0.0.0/0
+                  port_range_min: 22
+                  port_range_max: 22
+                - protocol: icmp
+                  remote_ip_prefix: 0.0.0.0/0
+
+    vrts_instance_port:
+        type: OS::Neutron::Port
+        properties:
+            network_id: { get_resource: vrts_private_network }
+            security_groups:
+                - default
+                - { get_resource: vrts_security_group }
+
+    vrts_floating_ip:
+        type: OS::Neutron::FloatingIP
+        properties:
+            floating_network: { get_param: public_network }
+
+    vrts_cloud_config:
+        type: OS::Heat::CloudConfig
+        properties:
+            cloud_config:
+                hostname: { get_param: hostname }
+                fqdn: { get_param: fqdn }
+                manage_etc_hosts: true
+                manage_resolv_conf: true
+                runcmd:
+                    - [ mount, {get_param: vcs_install_media}, /mnt ]
+                
+                yum_repos:
+                    rhel7-media:
+                        name: Red Hat Enterprise Linux 7 u2
+                        baseurl: { get_param: rhel7_u2_x86_media }
+                        enabled: true
+                        gpgcheck: false
+                    infoscale71:
+                        name: Repository for Veritas InfoScale 7.1
+                        baseurl: file:///mnt/dvd1-redhatlinux/rhel7_x86_64/rpms/
+                        enabled: true
+                        gpgcheck: true
+                        gpgkey: file:///mnt/dvd1-redhatlinux/rhel7_x86_64/rpms/RPM-GPG-KEY-veritas-infoscale7
+                write_files:
+                    - path: /tmp/vcs-install.resp
+                      permissions: '0644'
+                      content: |
+                        #
+                        # Configuration Values:
+                        #
+                        our %CFG;
+                        
+                        $CFG{accepteula}=1;
+                        $CFG{vcs_allowcomms}=0;
+                        $CFG{opt}{gco}=0;
+                        $CFG{opt}{configure}=1;
+                        $CFG{prod}="AVAILABILITY71";
+                        $CFG{activecomponent}=[ qw(VCS71) ];
+                        $CFG{systems}=[ qw( { get_param: hostname} ) ];
+                        $CFG{vcs_clusterid}=13227;
+                        $CFG{vcs_clustername}="vrts-clus";
+                        $CFG{opt}{logpath}="/opt/VRTS/install/logs/installer-vcs/installer-cloud-config.response";
+
+                        1;
+                runcmd:
+                    - yum update -y
+                    - yum groupinstall AVAILABILITY71 -y
+                    - [ sh, -c, /opt/VRTS/install/bin/UXRT71/add_install_scripts ]
+                    - dd if=/dev/zero of=/swap count=257 bs=1M
+                    - chmod 0600 /swap
+                    - mkswap /swap
+                    - swapon /swap
+                    - [ sh, -c, echo "/swap swap swap defaults 0 0" >> /etc/fstab ]
+                    - /opt/VRTSvlic/bin/vxkeyless --quiet set AVAILABILITY
+                    - /opt/VRTS/install/installer -responsefile /tmp/vcs-install.resp
+                    - echo "export PATH=$PATH:/opt/VRTSvcs/bin" >> /root/.bashrc
+                packages:
+                    - vim
+
+    vrts_instance:
+        type: OS::Nova::Server
+        properties:
+            name: vrts-vm1
+            image: { get_param: image }
+            flavor: { get_param: flavor }
+            key_name: { get_param: key }
+            networks:
+                - port: { get_resource: vrts_instance_port }
+            user_data: { get_resource: vrts_cloud_config }
+            user_data_format: RAW
+
+    vrts_floating_ip_association:
+        type: OS::Nova::FloatingIPAssociation
+        properties:
+            floating_ip: { get_resource: vrts_floating_ip }
+            server_id: { get_resource: vrts_instance }
+
+outputs:
+    private_ip:
+        description: IP address of the instance
+        value: { get_attr: [vrts_instance, first_address] }
+    public_ip:
+        description: Public IP address of the instance
+        value: { get_attr: [vrts_floating_ip, floating_ip_address] }
